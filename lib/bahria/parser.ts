@@ -42,16 +42,22 @@ export function parsePortalPage(html: string, url: string): PortalPage {
     // Layout table: a row whose single cell wraps another table — skip it,
     // the inner table will be visited on its own.
     let isLayout = false;
-    const grid: { cells: string[]; link: string | null; hasTh: boolean }[] = [];
+    const grid: { cells: string[]; cellLinks: (string | null)[]; link: string | null; hasTh: boolean }[] = [];
     directRows.each((_, tr) => {
       const $tr = $(tr);
       const $cells = $tr.children("td, th");
       if ($cells.length === 1 && $cells.find("table").length > 0) { isLayout = true; return; }
       const cells: string[] = [];
-      $cells.each((_, c) => { cells.push(norm($(c).text())); });
+      const cellLinks: (string | null)[] = [];
+      $cells.each((_, c) => {
+        const $c = $(c);
+        cells.push(norm($c.text()));
+        const a = $c.find("a[href]").first();
+        cellLinks.push(a.length ? resolveHref(a.attr("href") || "", url) : null);
+      });
       const firstAnchor = $tr.find("a[href]").first();
       const link = firstAnchor.length ? resolveHref(firstAnchor.attr("href") || "", url) : null;
-      grid.push({ cells, link, hasTh: $cells.filter("th").length > 0 });
+      grid.push({ cells, cellLinks, link, hasTh: $cells.filter("th").length > 0 });
     });
     if (isLayout || grid.length === 0) return;
 
@@ -65,10 +71,12 @@ export function parsePortalPage(html: string, url: string): PortalPage {
     const isData = (hasHeader && dataRows.length >= 1) || (dataRows.length >= 2 && colCount >= 2);
     if (!isData) return;
 
-    const rows = dataRows.filter((r) => r.cells.some((c) => c.length > 0)).map((r) => r.cells);
-    const rowLinks = dataRows.filter((r) => r.cells.some((c) => c.length > 0)).map((r) => r.link);
+    const kept = dataRows.filter((r) => r.cells.some((c) => c.length > 0));
+    const rows = kept.map((r) => r.cells);
+    const rowLinks = kept.map((r) => r.link);
+    const cellLinks = kept.map((r) => r.cellLinks);
     if (rows.length === 0) return;
-    const table: PortalTable = { headers, rows, rowLinks };
+    const table: PortalTable = { headers, rows, rowLinks, cellLinks };
     const signature = JSON.stringify(table);
     if (seen.has(signature)) return;
     seen.add(signature);
@@ -177,6 +185,31 @@ export function pickActionButton(info: WebFormInfo): string | null {
     .filter((x) => x.score > 0)
     .sort((a, b2) => b2.score - a.score);
   return scored.length ? scored[0].b : null;
+}
+
+/**
+ * The CMS TimeTable page has no HTML table: the schedule is JSON in the
+ * hidden field `BodyPH_hfCalendarJson` (HTML-escaped in the source; cheerio
+ * hands us the attribute entity-decoded). Returns the parsed object or null.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function extractCalendarJson(html: string): Record<string, any> | null {
+  const $ = cheerio.load(html);
+  const el = $('input[id$="hfCalendarJson"], input[name$="hfCalendarJson"]').first();
+  const raw = el.attr("value");
+  if (!raw) return null;
+  const attempts = [
+    raw,
+    raw.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, "&"),
+    raw.replace(/\\"/g, '"')
+  ];
+  for (const a of attempts) {
+    try {
+      const parsed = JSON.parse(a);
+      if (parsed && typeof parsed === "object") return parsed;
+    } catch { /* try the next unescaping */ }
+  }
+  return null;
 }
 
 export function extractErrorText(html: string): string | null {

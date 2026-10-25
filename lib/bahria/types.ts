@@ -3,6 +3,8 @@ export interface PortalTable {
   rows: string[][];
   /** Parallel to `rows`: the first real link found in that row (absolute URL), if any. */
   rowLinks?: (string | null)[];
+  /** Parallel to `rows` and to each row's cells: the first link inside that cell, if any. */
+  cellLinks?: (string | null)[][];
 }
 export interface PortalLink { text: string; href: string; }
 export interface PortalPage {
@@ -52,6 +54,43 @@ export interface CourseResourcesGroup {
 }
 export interface CourseResources {
   groups: CourseResourcesGroup[];
+  sourcePages: string[];
+}
+
+/** One course's attendance, followed from the StudentWiseAttendance "Detail" links. */
+export interface AttendanceCourse {
+  /** Cells of the course's row on the attendance course table (label text only). */
+  course: string[];
+  detailUrl: string;
+  /** Label/value pairs from the detail page's course-info table. */
+  info: [string, string][];
+  totalHours: number;
+  presentHours: number;
+  absentHours: number;
+  /** present / total * 100, one decimal; null when total is 0. */
+  percentage: number | null;
+  /** The per-class sessions table from the detail page, when present. */
+  sessions: PortalTable | null;
+}
+export interface AttendanceResult {
+  page: PortalPage;
+  courses: AttendanceCourse[];
+}
+
+/** The TimeTable page carries its schedule as JSON in a hidden field, not as a table. */
+export interface TimetableResult {
+  page: PortalPage;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  calendar: Record<string, any> | null;
+}
+
+/** LMS (lms.bahria.edu.pk) feature data: parsed tables grouped by course. */
+export interface LmsTableGroup {
+  course: string;
+  tables: PortalTable[];
+}
+export interface LmsFeatureResult {
+  groups: LmsTableGroup[];
   sourcePages: string[];
 }
 
