@@ -8,6 +8,9 @@ import type { PortalPage } from "@/lib/bahria/types";
 
 const SHORTCUTS = [
   { href: "/courses", title: "Courses", desc: "Enrolled courses and materials" },
+  { href: "/assignments", title: "Assignments", desc: "Assignments from your courses" },
+  { href: "/quizzes", title: "Quizzes", desc: "Quizzes from your courses" },
+  { href: "/materials", title: "Lecture Notes", desc: "Lecture notes, slides and files" },
   { href: "/attendance", title: "Attendance", desc: "Attendance by course" },
   { href: "/marks", title: "Marks", desc: "Results and assessments" },
   { href: "/timetable", title: "Timetable", desc: "Weekly class schedule" },
@@ -32,13 +35,16 @@ export default function DashboardPage() {
       <div><h1 className="text-2xl font-semibold tracking-tight">Dashboard</h1><p className="text-sm text-muted-foreground mt-1">{page.title || "Welcome to Bahria University"}</p></div>
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
         {SHORTCUTS.map((s) => (
-          <Link key={s.href} href={s.href}><Card className="hover:bg-zinc-50 transition-colors"><CardHeader><CardTitle className="text-base">{s.title}</CardTitle><CardDescription>{s.desc}</CardDescription></CardHeader></Card></Link>
+          <Link key={s.href} href={s.href}><Card className="hover:bg-accent transition-colors"><CardHeader><CardTitle className="text-base">{s.title}</CardTitle><CardDescription>{s.desc}</CardDescription></CardHeader></Card></Link>
         ))}
       </div>
       {page.tables.map((table, i) => (
         <Card key={i}><CardHeader><CardTitle className="text-base">{page.headings[i] || "From the portal"}</CardTitle></CardHeader><CardContent><PortalTableView table={table} /></CardContent></Card>
       ))}
       {page.tables.length === 0 && <Card><CardContent className="pt-6"><p className="text-sm text-muted-foreground">The portal dashboard returned no tables. Use the shortcuts above — each section fetches its own page directly from Bahria.</p></CardContent></Card>}
+      <p className="text-xs text-muted-foreground">
+        Section showing empty? <a href="/api/debug/nav" target="_blank" rel="noreferrer" className="underline underline-offset-2 hover:text-foreground">Portal diagnostics</a> — the portal URLs each section resolved to (URLs only, no personal data).
+      </p>
     </div>
   );
 }
