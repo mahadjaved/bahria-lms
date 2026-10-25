@@ -26,7 +26,7 @@ export function PortalPageView({ page, title }: { page: PortalPage; title: strin
       ))}
       {page.links.length > 0 && (
         <Card><CardHeader><CardTitle className="text-base">Links from the portal</CardTitle></CardHeader><CardContent>
-          <ul className="space-y-1 text-sm">{page.links.slice(0, 40).map((l, i) => <li key={i} className="text-muted-foreground">{l.text || l.href}</li>)}</ul>
+          <ul className="space-y-1 text-sm">{page.links.slice(0, 40).map((l, i) => <li key={i}><a href={l.href} target="_blank" rel="noreferrer" className="text-muted-foreground hover:text-foreground hover:underline underline-offset-2">{l.text || l.href}</a></li>)}</ul>
         </CardContent></Card>
       )}
     </div>
