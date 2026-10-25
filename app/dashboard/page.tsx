@@ -11,6 +11,7 @@ const SHORTCUTS = [
   { href: "/assignments", title: "Assignments", desc: "Assignments from your courses" },
   { href: "/quizzes", title: "Quizzes", desc: "Quizzes from your courses" },
   { href: "/materials", title: "Lecture Notes", desc: "Lecture notes, slides and files" },
+  { href: "/announcements", title: "Announcements", desc: "Announcements from the LMS" },
   { href: "/attendance", title: "Attendance", desc: "Attendance by course" },
   { href: "/marks", title: "Marks", desc: "Results and assessments" },
   { href: "/timetable", title: "Timetable", desc: "Weekly class schedule" },

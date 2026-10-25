@@ -2,7 +2,7 @@
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
-import { BookOpen, CalendarDays, ClipboardList, FileQuestion, FolderOpen, GraduationCap, LayoutDashboard, LogOut, Menu, NotebookPen, User, Wallet, X } from "lucide-react";
+import { Bell, BookOpen, CalendarDays, ClipboardList, FileQuestion, FolderOpen, GraduationCap, LayoutDashboard, LogOut, Menu, NotebookPen, User, Wallet, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { cn } from "@/lib/utils";
@@ -13,6 +13,7 @@ const NAV = [
   { href: "/assignments", label: "Assignments", icon: NotebookPen },
   { href: "/quizzes", label: "Quizzes", icon: FileQuestion },
   { href: "/materials", label: "Lecture Notes", icon: FolderOpen },
+  { href: "/announcements", label: "Announcements", icon: Bell },
   { href: "/attendance", label: "Attendance", icon: ClipboardList },
   { href: "/marks", label: "Marks", icon: GraduationCap },
   { href: "/timetable", label: "Timetable", icon: CalendarDays },

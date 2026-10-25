@@ -1,32 +1,63 @@
+import * as cheerio from "cheerio";
+import { Impit } from "impit";
 import { BAHRIA_BASE_URL, LOGIN_PATH } from "./constants";
 import { PORTAL_PATHS, type PortalFeature } from "./paths";
 import {
-  parsePortalPage, extractHiddenFields, extractErrorText, extractStudentName,
+  parsePortalPage, extractHiddenFields, extractErrorText, extractStudentName, extractCalendarJson,
   analyzeWebForm, isSemesterSelect, pickSemesterValue, pickActionButton, type WebFormInfo
 } from "./parser";
-import { UnauthorizedError, type CourseResources, type CourseResourcesGroup, type PortalLink, type PortalPage, type ResourceItem, type SessionData } from "./types";
+import {
+  UnauthorizedError, type AttendanceCourse, type AttendanceResult, type PortalLink, type PortalPage,
+  type SessionData, type TimetableResult
+} from "./types";
 import { createSession, saveSession, withSessionLock } from "./store";
+
+/**
+ * ALL portal traffic goes through ONE Chrome-impersonating HTTP client.
+ *
+ * Why: cms.bahria.edu.pk sits behind a WAF that fingerprints the TLS/HTTP2
+ * stack. A plain Node fetch (or curl) login appears to succeed, but the
+ * session is then killed at /Sys/Student/PrepareSession.aspx and bounced
+ * PrepareSession -> Logoff.aspx -> Login.aspx. With a real Chrome
+ * fingerprint (impit, `browser: "chrome"`) the identical flow lands on the
+ * dashboard and stays alive. Do not replace this with global fetch.
+ */
+const g = globalThis as unknown as { __bahriaImpit?: Impit };
+function http(): Impit {
+  if (!g.__bahriaImpit) g.__bahriaImpit = new Impit({ browser: "chrome" });
+  return g.__bahriaImpit;
+}
+
+const CHROME_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 export type CookieJar = Map<string, string>;
 export function jarFromRecord(rec: Record<string, string>): CookieJar { return new Map(Object.entries(rec)); }
 export function jarToRecord(jar: CookieJar): Record<string, string> { return Object.fromEntries(jar); }
 function cookieHeader(jar: CookieJar): string { return [...jar.entries()].map(([k, v]) => `${k}=${v}`).join("; "); }
-function storeCookies(jar: CookieJar, res: Response) {
-  const setCookies: string[] = (res.headers as any).getSetCookie ? (res.headers as any).getSetCookie() : [];
+function storeCookies(jar: CookieJar, res: { headers: Headers }) {
+  const setCookies: string[] = (res.headers as unknown as { getSetCookie?: () => string[] }).getSetCookie
+    ? (res.headers as unknown as { getSetCookie: () => string[] }).getSetCookie()
+    : [];
   for (const sc of setCookies) {
     const pair = sc.split(";")[0]; const idx = pair.indexOf("=");
     if (idx > 0) jar.set(pair.slice(0, idx).trim(), pair.slice(idx + 1).trim());
   }
 }
 
-interface FetchResult { status: number; url: string; html: string; jar: CookieJar; }
-async function fetchWithJar(jar: CookieJar, url: string, init: RequestInit = {}, maxRedirects = 6): Promise<FetchResult> {
+export interface FetchResult { status: number; url: string; html: string; jar: CookieJar; }
+
+/**
+ * Cookie-aware fetch with manual redirect handling: every hop's Set-Cookie
+ * headers are folded into the jar immediately (the caller persists the jar
+ * to the session store after the whole operation).
+ */
+export async function fetchWithJar(jar: CookieJar, url: string, init: { method?: string; body?: string; headers?: Record<string, string> } = {}, maxRedirects = 10): Promise<FetchResult> {
   let currentUrl = url; let method = init.method || "GET"; let body = init.body;
   for (let i = 0; i <= maxRedirects; i++) {
-    const res = await fetch(currentUrl, {
-      method, body: method === "GET" ? undefined : body, redirect: "manual",
-      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", ...(init.headers || {}), Cookie: cookieHeader(jar), ...(method !== "GET" ? { "Content-Type": "application/x-www-form-urlencoded" } : {}) }
-    } as RequestInit);
+    const res = await http().fetch(currentUrl, {
+      method: method as "GET" | "POST", body: method === "GET" ? undefined : body, redirect: "manual",
+      headers: { "User-Agent": CHROME_UA, ...(init.headers || {}), Cookie: cookieHeader(jar), ...(method !== "GET" ? { "Content-Type": "application/x-www-form-urlencoded" } : {}) }
+    });
     storeCookies(jar, res);
     if ([301, 302, 303, 307, 308].includes(res.status)) {
       const loc = res.headers.get("location"); if (!loc) return { status: res.status, url: currentUrl, html: await res.text(), jar };
@@ -40,9 +71,11 @@ async function fetchWithJar(jar: CookieJar, url: string, init: RequestInit = {},
 }
 
 function assertLoggedIn(result: FetchResult) {
-  if (result.url.includes("Login.aspx")) throw new UnauthorizedError("Bahria session expired. Please log in again.");
+  if (result.url.includes("Login.aspx") || result.url.includes("Logoff.aspx")) {
+    throw new UnauthorizedError("Bahria session expired. Please log in again.");
+  }
 }
-function resolveUrl(path: string): string {
+export function resolveUrl(path: string): string {
   return path.startsWith("http") ? path : BAHRIA_BASE_URL + (path.startsWith("/") ? path : "/" + path);
 }
 function pageScore(page: PortalPage): number {
@@ -52,10 +85,11 @@ function pageScore(page: PortalPage): number {
 function pageHasData(page: PortalPage): boolean { return page.tables.some((t) => t.rows.length > 0); }
 
 /* ------------------------------------------------------------------ */
-/* Nav discovery                                                       */
+/* Nav discovery (bonus — the verified paths in paths.ts are primary)  */
 /* ------------------------------------------------------------------ */
 
 const NAV_RULES: [PortalFeature, RegExp][] = [
+  ["announcements", /announcement/i],
   ["assignments", /assignment/i],
   ["quizzes", /quiz/i],
   ["materials", /lecture|course\s?folder|coursefolder|material|notes|download|resource/i],
@@ -116,8 +150,15 @@ async function ensureNavInternal(session: SessionData, jar: CookieJar) {
   }
 }
 
+/** Candidate URLs for a CMS feature: verified path first, then the discovered menu URL, then fallbacks. */
+function featureCandidates(session: SessionData, feature: PortalFeature): string[] {
+  const paths = PORTAL_PATHS[feature] as unknown as string[];
+  const all = [BAHRIA_BASE_URL + paths[0], session.nav[feature], ...paths.slice(1).map((p) => BAHRIA_BASE_URL + p)];
+  return all.filter((v, i, a): v is string => !!v && a.indexOf(v) === i && v.includes("/Sys/"));
+}
+
 /* ------------------------------------------------------------------ */
-/* WebForms postbacks                                                  */
+/* WebForms postbacks (fallback for CMS pages whose grids need one)    */
 /* ------------------------------------------------------------------ */
 
 interface PostbackAttempt { target: string; overrides: Record<string, string>; }
@@ -147,11 +188,6 @@ async function doPostback(jar: CookieJar, info: WebFormInfo, attempt: PostbackAt
   return fetchWithJar(jar, info.action, { method: "POST", body: form.toString() });
 }
 
-/**
- * GET a page; if its grids are empty, replay the WebForms postbacks Aspire
- * needs to populate them (search/show button, semester select). Returns the
- * richest page obtained.
- */
 async function fetchWithPostbacks(jar: CookieJar, url: string, budget: { n: number }): Promise<PortalPage> {
   const first = await fetchWithJar(jar, url); budget.n++;
   assertLoggedIn(first);
@@ -184,9 +220,7 @@ async function getPortalPageInternal(jar: CookieJar, path: string): Promise<Port
 
 async function getFeaturePageInternal(session: SessionData, jar: CookieJar, feature: PortalFeature): Promise<PortalPage> {
   await ensureNavInternal(session, jar);
-  const discovered = session.nav[feature];
-  const candidates = [discovered, ...(PORTAL_PATHS[feature] as unknown as string[]).map((p) => BAHRIA_BASE_URL + p)]
-    .filter((v, i, a): v is string => !!v && a.indexOf(v) === i);
+  const candidates = featureCandidates(session, feature);
   const budget = { n: 0 };
   let richest: PortalPage | null = null;
   let lastError: unknown = null;
@@ -205,106 +239,109 @@ async function getFeaturePageInternal(session: SessionData, jar: CookieJar, feat
   throw lastError instanceof Error ? lastError : new Error("Could not load page from Bahria portal");
 }
 
-const FILE_EXT_RE = /\.(pdf|docx?|pptx?|xlsx?|zip|rar)(\?|#|$)/i;
-const KIND_MATCHERS: Record<string, (text: string, href: string) => boolean> = {
-  assignments: (t, h) => /assignment/i.test(t) || /assignment/i.test(h),
-  quizzes: (t, h) => /quiz/i.test(t) || /quiz/i.test(h),
-  materials: (t, h) => /lecture|notes|slide|material|book|handout|download/i.test(t) || /_uploaded_documents/i.test(h) || FILE_EXT_RE.test(h)
-};
-
-async function getCourseResourcesInternal(session: SessionData, jar: CookieJar, kind: "assignments" | "quizzes" | "materials"): Promise<CourseResources> {
+/** GET the first candidate that yields a parsed page (verified pages need no postbacks). */
+async function fetchCandidatePage(session: SessionData, jar: CookieJar, feature: PortalFeature): Promise<{ page: PortalPage; html: string; url: string }> {
   await ensureNavInternal(session, jar);
-  const matches = KIND_MATCHERS[kind];
-  const groups = new Map<string, CourseResourcesGroup & { seen: Set<string> }>();
-  const sourcePages: string[] = [];
-  const addItem = (course: string, courseUrl: string | undefined, item: ResourceItem) => {
-    if (!item.href || !item.title) return;
-    let g = groups.get(course);
-    if (!g) { g = { course, courseUrl, items: [], seen: new Set() }; groups.set(course, g); }
-    if (g.seen.has(item.href)) return;
-    g.seen.add(item.href);
-    if (g.items.length < 60) g.items.push(item);
-  };
-  const harvestPage = (page: PortalPage, courseName: string) => {
-    for (const link of page.links) {
-      if (matches(link.text, link.href)) {
-        addItem(courseName, page.url, { title: link.text || link.href.split("/").pop() || link.href, href: link.href, kind });
-      }
-    }
-    for (const table of page.tables) {
-      table.rows.forEach((row, i) => {
-        const href = table.rowLinks?.[i] || null;
-        if (href && matches(row.join(" "), href)) {
-          addItem(courseName, page.url, { title: row.filter(Boolean).join(" — ") || href, href, kind });
-        }
-      });
-    }
-  };
-
-  // (a) The feature's own discovered / candidate page(s).
-  const featureUrls = [session.nav[kind], ...((PORTAL_PATHS[kind] as unknown as string[]).map((p) => BAHRIA_BASE_URL + p))]
-    .filter((v, i, a): v is string => !!v && a.indexOf(v) === i).slice(0, 3);
-  for (const url of featureUrls) {
+  let richest: { page: PortalPage; html: string; url: string } | null = null;
+  let lastError: unknown = null;
+  for (const url of featureCandidates(session, feature)) {
     try {
-      const budget = { n: 0 };
-      const page = await fetchWithPostbacks(jar, url, budget);
-      sourcePages.push(page.url);
-      harvestPage(page, page.title || kind);
-      // Tables on a feature page are real records even when they carry no link.
-      for (const table of page.tables) {
-        table.rows.forEach((row, i) => {
-          const title = row.filter(Boolean).join(" — ");
-          if (title) addItem(page.title || kind, page.url, { title, href: table.rowLinks?.[i] || page.url, kind });
-        });
-      }
-      if (groups.size > 0) break;
-    } catch (e) { if (e instanceof UnauthorizedError) throw e; }
+      const r = await fetchWithJar(jar, url);
+      assertLoggedIn(r);
+      const page = parsePortalPage(r.html, r.url);
+      if (pageHasData(page)) return { page, html: r.html, url: r.url };
+      if (!richest || pageScore(page) > pageScore(richest.page)) richest = { page, html: r.html, url: r.url };
+    } catch (e) {
+      lastError = e;
+      if (e instanceof UnauthorizedError) throw e;
+    }
   }
+  if (richest) return richest;
+  throw lastError instanceof Error ? lastError : new Error("Could not load page from Bahria portal");
+}
 
-  // (b) Each course's own page, reached from the courses list.
-  try {
-    const coursesPage = await getFeaturePageInternal(session, jar, "courses");
-    sourcePages.push(coursesPage.url);
-    harvestPage(coursesPage, "Courses");
-    const navUrls = new Set(Object.values(session.nav));
-    const targets = new Map<string, string>(); // course name -> url
-    for (const table of coursesPage.tables) {
-      table.rows.forEach((row, i) => {
-        const href = table.rowLinks?.[i];
-        if (href && !navUrls.has(href) && !/logout/i.test(href)) {
-          const name = row.filter(Boolean).slice(0, 2).join(" — ");
-          if (name) targets.set(name, href);
-        }
-      });
-    }
-    for (const link of coursesPage.links) {
-      if (!link.href.includes(".aspx")) continue;
-      if (navUrls.has(link.href) || /logout|dashboard|profile/i.test(link.href)) continue;
-      if (link.text.length >= 3 && !targets.has(link.text)) targets.set(link.text, link.href);
-    }
-    let visited = 0;
-    for (const [name, url] of targets) {
-      if (visited >= 10 || groups.size >= 15) break;
-      visited++;
+/* ---------------- Attendance: course table -> per-course Detail pages ---------------- */
+
+function num(s: string | undefined): number {
+  const n = parseFloat((s || "").replace(/[^0-9.]/g, ""));
+  return isNaN(n) ? 0 : n;
+}
+
+async function getAttendanceInternal(session: SessionData, jar: CookieJar): Promise<AttendanceResult> {
+  const { page, html } = await fetchCandidatePage(session, jar, "attendance");
+  // The course table's rows each carry a "Detail" anchor to
+  // AttendanceSummary.aspx?v=<encrypted>. Collect them in document order —
+  // they pair with the main table's rows in the same order.
+  const $ = cheerio.load(html);
+  const detailUrls: string[] = [];
+  $('a[href*="AttendanceSummary.aspx"]').each((_, a) => {
+    const href = $(a).attr("href") || "";
+    try { detailUrls.push(new URL(href, page.url).toString()); } catch { /* skip */ }
+  });
+  const mainTable = page.tables.find((t) => t.rows.length > 0) || null;
+  const courses: AttendanceCourse[] = [];
+  if (mainTable) {
+    for (let i = 0; i < mainTable.rows.length && courses.length < 15; i++) {
+      const row = mainTable.rows[i];
+      const detailUrl = detailUrls[i] || mainTable.rowLinks?.[i] || null;
+      if (!detailUrl || !detailUrl.includes("AttendanceSummary.aspx")) continue;
       try {
-        const page = await getPortalPageInternal(jar, url);
-        sourcePages.push(page.url);
-        harvestPage(page, name);
+        const r = await fetchWithJar(jar, detailUrl);
+        assertLoggedIn(r);
+        const detail = parsePortalPage(r.html, r.url);
+        const sessions = detail.tables.find((t) => t.headers.some((h) => /class date/i.test(h)))
+          || detail.tables[1] || null;
+        const infoTable = detail.tables.find((t) => t !== sessions) || null;
+        const info: [string, string][] = infoTable
+          ? infoTable.rows.filter((r2) => r2.length >= 2).map((r2) => [r2[0], r2.slice(1).join(" ")] as [string, string])
+          : [];
+        let totalHours = 0, presentHours = 0, absentHours = 0;
+        if (sessions) {
+          const ti = sessions.headers.findIndex((h) => /total hours/i.test(h));
+          const pi = sessions.headers.findIndex((h) => /present hours/i.test(h));
+          const ai = sessions.headers.findIndex((h) => /absent hours/i.test(h));
+          for (const srow of sessions.rows) {
+            if (ti >= 0) totalHours += num(srow[ti]);
+            if (pi >= 0) presentHours += num(srow[pi]);
+            if (ai >= 0) absentHours += num(srow[ai]);
+          }
+        }
+        const percentage = totalHours > 0 ? Math.round((presentHours / totalHours) * 1000) / 10 : null;
+        courses.push({
+          course: row.filter((c) => !/^detail$/i.test(c.trim())),
+          detailUrl,
+          info,
+          totalHours, presentHours, absentHours,
+          percentage,
+          sessions
+        });
       } catch (e) { if (e instanceof UnauthorizedError) throw e; }
     }
-  } catch (e) { if (e instanceof UnauthorizedError) throw e; }
+  }
+  return { page, courses };
+}
 
-  // (c) The LMS entry point — follow it and harvest whatever it lands on.
-  try {
-    const lmsPage = await getPortalPageInternal(jar, session.nav["lms"] || "/Sys/Common/GoToLMS.aspx");
-    sourcePages.push(lmsPage.url);
-    harvestPage(lmsPage, "LMS");
-  } catch (e) { if (e instanceof UnauthorizedError) throw e; }
+/* ---------------- Timetable: schedule JSON in a hidden field ---------------- */
 
-  return {
-    groups: [...groups.values()].filter((g) => g.items.length > 0).map(({ seen, ...g }) => g),
-    sourcePages: [...new Set(sourcePages)]
-  };
+async function getTimetableInternal(session: SessionData, jar: CookieJar): Promise<TimetableResult> {
+  await ensureNavInternal(session, jar);
+  let richest: PortalPage | null = null;
+  let lastError: unknown = null;
+  for (const url of featureCandidates(session, "timetable")) {
+    try {
+      const r = await fetchWithJar(jar, url);
+      assertLoggedIn(r);
+      const calendar = extractCalendarJson(r.html);
+      const page = parsePortalPage(r.html, r.url);
+      if (calendar) return { page, calendar };
+      if (!richest || pageScore(page) > pageScore(richest)) richest = page;
+    } catch (e) {
+      lastError = e;
+      if (e instanceof UnauthorizedError) throw e;
+    }
+  }
+  if (richest) return { page: richest, calendar: null };
+  throw lastError instanceof Error ? lastError : new Error("Could not load timetable from Bahria portal");
 }
 
 /* ------------------------------------------------------------------ */
@@ -322,23 +359,32 @@ async function runWithJar<T>(session: SessionData, fn: (jar: CookieJar) => Promi
   }
 }
 
+/** Run `fn` with the session's live cookie jar, under the per-session lock. */
+export async function withJar<T>(session: SessionData, fn: (jar: CookieJar) => Promise<T>): Promise<T> {
+  return withSessionLock(session.id, () => runWithJar(session, fn));
+}
+
 export async function getPortalPage(session: SessionData, path: string): Promise<PortalPage> {
-  return withSessionLock(session.id, () => runWithJar(session, (jar) => getPortalPageInternal(jar, path)));
+  return withJar(session, (jar) => getPortalPageInternal(jar, path));
 }
 
 export async function getFeaturePage(session: SessionData, feature: PortalFeature): Promise<PortalPage> {
-  return withSessionLock(session.id, () => runWithJar(session, (jar) => getFeaturePageInternal(session, jar, feature)));
+  return withJar(session, (jar) => getFeaturePageInternal(session, jar, feature));
 }
 
-export async function getCourseResources(session: SessionData, kind: "assignments" | "quizzes" | "materials"): Promise<CourseResources> {
-  return withSessionLock(session.id, () => runWithJar(session, (jar) => getCourseResourcesInternal(session, jar, kind)));
+export async function getAttendance(session: SessionData): Promise<AttendanceResult> {
+  return withJar(session, (jar) => getAttendanceInternal(session, jar));
+}
+
+export async function getTimetable(session: SessionData): Promise<TimetableResult> {
+  return withJar(session, (jar) => getTimetableInternal(session, jar));
 }
 
 export async function ensureNav(session: SessionData): Promise<Record<string, string>> {
-  return withSessionLock(session.id, () => runWithJar(session, async (jar) => {
+  return withJar(session, async (jar) => {
     await ensureNavInternal(session, jar);
     return session.nav;
-  }));
+  });
 }
 
 export interface LoginResult { session: SessionData; }
@@ -362,6 +408,11 @@ export async function loginToBahria(input: { enrollment: string; password: strin
     const err = extractErrorText(posted.html);
     throw new Error(err || "Login failed. Check your enrollment, password, institute and account type.");
   }
+  // Establish the LMS (lms.bahria.edu.pk) session inside the same jar NOW:
+  // GoToLMS redirects to the LMS dashboard and sets the LMS cookies.
+  try {
+    await fetchWithJar(jar, BAHRIA_BASE_URL + "/Sys/Common/GoToLMS.aspx");
+  } catch { /* LMS warm-up is best-effort; LMS fetchers can retry later */ }
   const name = extractStudentName(posted.html);
   const session = createSession({
     cookies: jarToRecord(jar),
@@ -372,8 +423,7 @@ export async function loginToBahria(input: { enrollment: string; password: strin
     loggedInAt: Date.now()
   });
   // Discover the real menu URLs from the authenticated landing page now,
-  // while we know the jar is fresh — later feature lookups prefer these
-  // over the guessed candidate paths.
+  // while we know the jar is fresh — used as a bonus after verified paths.
   try {
     await discoverNavInternal(session, jar, posted.html, posted.url);
   } catch { /* discovery is best-effort; it retries lazily on first use */ }

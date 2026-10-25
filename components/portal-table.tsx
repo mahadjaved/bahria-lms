@@ -9,7 +9,16 @@ export function PortalTableView({ table }: { table: PortalTableType }) {
       )}
       <TableBody>
         {table.rows.map((row, i) => (
-          <TableRow key={i}>{row.map((cell, j) => <TableCell key={j}>{cell || "—"}</TableCell>)}</TableRow>
+          <TableRow key={i}>{row.map((cell, j) => {
+            const href = table.cellLinks?.[i]?.[j];
+            return (
+              <TableCell key={j}>
+                {href
+                  ? <a href={href} target="_blank" rel="noreferrer" className="text-primary underline underline-offset-2 hover:opacity-80">{cell || "Open"}</a>
+                  : (cell || "—")}
+              </TableCell>
+            );
+          })}</TableRow>
         ))}
       </TableBody>
     </Table>
