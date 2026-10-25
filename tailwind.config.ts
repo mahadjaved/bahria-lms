@@ -17,7 +17,11 @@ const config: Config = {
         destructive: { DEFAULT: "hsl(var(--destructive))", foreground: "hsl(var(--destructive-foreground))" },
         card: { DEFAULT: "hsl(var(--card))", foreground: "hsl(var(--card-foreground))" }
       },
-      borderRadius: { lg: "var(--radius)", md: "calc(var(--radius) - 2px)", sm: "calc(var(--radius) - 4px)" }
+      borderRadius: { lg: "var(--radius)", md: "calc(var(--radius) - 2px)", sm: "calc(var(--radius) - 4px)" },
+      fontFamily: {
+        sans: ["var(--font-geist-sans)", "system-ui", "-apple-system", "sans-serif"],
+        mono: ["var(--font-geist-mono)", "ui-monospace", "monospace"]
+      }
     }
   },
   plugins: []
