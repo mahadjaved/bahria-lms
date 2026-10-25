@@ -2,23 +2,29 @@ import { NextResponse } from "next/server";
 import { getSession } from "@/lib/session-server";
 import { ensureNav } from "@/lib/bahria/client";
 import { PORTAL_FEATURES, PORTAL_PATHS } from "@/lib/bahria/paths";
-import { BAHRIA_BASE_URL } from "@/lib/bahria/constants";
+import { BAHRIA_BASE_URL, LMS_BASE_URL } from "@/lib/bahria/constants";
 import { UnauthorizedError } from "@/lib/bahria/types";
+
+/** Features served from the LMS host; everything else is a CMS (/Sys/...) page. */
+const LMS_FEATURES = new Set(["assignments", "quizzes", "materials", "announcements"]);
 
 /**
  * Portal diagnostics — URLs only, no personal data.
- * Shows which portal URL each feature resolves to: the URL discovered from
- * the authenticated menu when available, otherwise the first candidate
- * fallback path. Safe to share when a section comes up empty.
+ * Shows which portal URL each feature resolves to: the verified real path
+ * (primary), or the URL discovered from the authenticated menu when the
+ * verified path doesn't apply. Safe to share when a section comes up empty.
  */
 export async function GET() {
   try {
     const session = getSession();
     const nav = await ensureNav(session);
-    const resolved: Record<string, { url: string; source: "discovered" | "candidate-fallback" }> = {};
+    const resolved: Record<string, { url: string; source: "verified" | "discovered" }> = {};
     for (const feature of PORTAL_FEATURES) {
-      if (nav[feature]) resolved[feature] = { url: nav[feature], source: "discovered" };
-      else resolved[feature] = { url: BAHRIA_BASE_URL + PORTAL_PATHS[feature][0], source: "candidate-fallback" };
+      // LMS features resolve to their verified LMS page; CMS features to
+      // their verified CMS path. `nav` above still shows any menu URLs that
+      // discovery found, for comparison.
+      const base = LMS_FEATURES.has(feature) ? LMS_BASE_URL : BAHRIA_BASE_URL;
+      resolved[feature] = { url: base + PORTAL_PATHS[feature][0], source: "verified" };
     }
     return NextResponse.json({ ok: true, nav, navDiscoveredAt: session.navDiscoveredAt || null, resolved });
   } catch (e) {

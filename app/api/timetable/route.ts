@@ -1,2 +1,2 @@
-import { featureResponse } from "@/lib/api-helpers";
-export async function GET() { return featureResponse("timetable"); }
+import { timetableResponse } from "@/lib/api-helpers";
+export async function GET() { return timetableResponse(); }
