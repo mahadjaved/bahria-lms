@@ -30,11 +30,25 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     if (pathname === "/login") { setChecked(true); return; }
-    fetch("/api/auth/me").then(async (r) => {
-      if (!r.ok) { router.replace("/login"); return; }
-      const d = await r.json();
-      setName(d.user?.name || ""); setEnrollment(d.user?.enrollment || ""); setChecked(true);
-    }).catch(() => router.replace("/login"));
+    let cancelled = false;
+    // One transient failure (a blip, a cold instance, a slow portal) must
+    // not nuke the session UX — retry once after ~1s and only bounce to
+    // /login when the retry also fails.
+    const check = async (isRetry: boolean) => {
+      try {
+        const r = await fetch("/api/auth/me");
+        if (!r.ok) throw new Error("unauthenticated");
+        const d = await r.json();
+        if (cancelled) return;
+        setName(d.user?.name || ""); setEnrollment(d.user?.enrollment || ""); setChecked(true);
+      } catch {
+        if (cancelled) return;
+        if (!isRetry) setTimeout(() => { void check(true); }, 1000);
+        else router.replace("/login");
+      }
+    };
+    void check(false);
+    return () => { cancelled = true; };
   }, [pathname, router]);
 
   async function logout() { await fetch("/api/auth/logout", { method: "POST" }); router.replace("/login"); }
