@@ -49,11 +49,11 @@ Bahria's CMS uses ASP.NET WebForms. Signing in is a server-side flow in `lib/bah
 
 Your password is **never stored**. It is used only for that one login POST to Bahria.
 
-## Sessions
+## Sessions & deployment
 
-Sessions live **server-side** in `lib/bahria/store.ts` (an in-memory store, persisted to `.data/sessions.json` so dev restarts don't log you out). The browser cookie holds only a signed, opaque session id.
+The session **travels with the browser**: after login, the whole session (including the live Bahria cookie jar) is AES-256-GCM-encrypted into the `bahria_session` cookie, and every API response re-issues that cookie with the freshest jar. That write-back is essential — Aspire **rotates its session cookie after login**, so a jar snapshotted once at login goes stale within seconds (the original design's bug). A server-side store (`lib/bahria/store.ts`, persisted to `.data/sessions.json`) remains as a per-process cache and request lock, and is merged with the cookie on every read — whichever side has the fresher jar wins. Explicit logout revokes the session id server-side, so a replayed pre-logout cookie is refused. Sessions expire after 12 hours of inactivity (sliding). Your portal password is never stored — it is used only for the login POST itself.
 
-This matters because Aspire **rotates its session cookie after login**: if the cookie jar were snapshotted into the browser at login time, every later request would reuse a stale jar and Bahria would bounce you back to the login page within seconds. Here, the live jar stays on the server and is updated after every portal response, requests for one session are serialized so the jar can't race, and sessions expire after 12 hours of inactivity (sliding).
+**Deployment note:** run the app as a **single server process** (the normal local / single-instance setup — fully verified end-to-end). Bahria's WAF binds a CMS session to the authenticated channel of the process that performed the login: a *different* backend process presenting the same cookies is bounced to the login page by the portal itself, no matter what the client sends. So on multi-instance/serverless hosting, keep this app on one sticky instance; splitting requests across instances will log users out of CMS sections (courses, attendance, marks…). LMS sections (assignments, quizzes, materials, announcements) are not bound this way. This is a portal constraint, not an app bug — the cookie-carried session ensures the app itself never loses a session that the portal still honors.
 
 ## Architecture
 
@@ -75,8 +75,8 @@ lib/bahria/
   client.ts              impit (Chrome) client, cookie jar, WebForms login, CMS fetchers
   lms.ts                 LMS select+POST-per-course harvester
   parser.ts              HTML -> headings / data tables / links, timetable JSON extraction
-  store.ts               Server-side session store (live cookie jars)
-  session.ts             Signed session-id cookie helpers
+  store.ts               Server-side session cache + per-session lock, logout revocations
+  session.ts             AES-256-GCM session-cookie payload (the session carrier)
 components/ui/           shadcn/ui components (button, card, table, input, ...)
 components/app-shell.tsx Sidebar (desktop) / sheet menu (mobile), top bar, theme toggle, logout
 ```

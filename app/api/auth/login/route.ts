@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { loginToBahria } from "@/lib/bahria/client";
-import { SESSION_COOKIE, SESSION_COOKIE_MAX_AGE, signSessionId } from "@/lib/bahria/session";
+import { withSessionCookie } from "@/lib/api-helpers";
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
@@ -8,11 +8,11 @@ export async function POST(req: NextRequest) {
     if (!enrollment || !password || !instituteId) return NextResponse.json({ ok: false, error: "Enrollment, password and institute are required." }, { status: 400 });
     const { session } = await loginToBahria({ enrollment: String(enrollment).trim(), password: String(password), instituteId: String(instituteId), subUserType: subUserType ? String(subUserType) : "None" });
     const res = NextResponse.json({ ok: true, user: { enrollment: session.enrollment, name: session.name || null, instituteId: session.instituteId } });
-    // The cookie carries only the signed opaque session id — the Bahria
-    // cookie jar itself stays in the server-side session store, so cookie
-    // rotation by the portal can never strand the browser with a stale jar.
-    res.cookies.set(SESSION_COOKIE, signSessionId(session.id), { httpOnly: true, sameSite: "lax", secure: process.env.NODE_ENV === "production", path: "/", maxAge: SESSION_COOKIE_MAX_AGE });
-    return res;
+    // The cookie carries the FULL encrypted session (Bahria cookie jar
+    // included), so the session travels with the browser and works on any
+    // server instance. It is re-issued with the freshest jar on every
+    // response — see withSessionCookie in lib/api-helpers.ts.
+    return withSessionCookie(res, session);
   } catch (e) {
     return NextResponse.json({ ok: false, error: e instanceof Error ? e.message : "Login failed" }, { status: 401 });
   }
