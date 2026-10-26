@@ -17,9 +17,13 @@ export interface PortalPage {
 }
 
 /**
- * A live Bahria session. This object lives ONLY on the server, in the
- * server-side session store (lib/bahria/store.ts). The browser cookie
- * holds nothing but the opaque `id`, signed — never the cookie jar.
+ * A live Bahria session. The authoritative copy travels with the browser in
+ * the AES-256-GCM-encrypted `bahria_session` cookie (see session.ts), which
+ * is re-issued on every API response with the freshest cookie jar — so the
+ * session works on any server process/instance, not just the one that
+ * handled the login. The server-side store (lib/bahria/store.ts) remains as
+ * a per-process cache + request lock and is merged with the cookie payload
+ * on every read (whichever has the larger `jarUpdatedAt` wins).
  * `cookies` is the live, mutable Bahria cookie jar: Aspire rotates its
  * session cookie after login, so the jar is updated after every response.
  */
@@ -33,13 +37,16 @@ export interface SessionData {
   loggedInAt: number;
   createdAt: number;
   lastSeenAt: number;
+  /** When the cookie jar last changed (ms epoch). Drives cookie/store merge. */
+  jarUpdatedAt: number;
   /** Feature -> absolute portal URL, discovered from the authenticated menu after login. */
   nav: Record<string, string>;
   navDiscoveredAt?: number;
 }
 
-export type SessionSeed = Omit<SessionData, "id" | "createdAt" | "lastSeenAt" | "nav"> & {
+export type SessionSeed = Omit<SessionData, "id" | "createdAt" | "lastSeenAt" | "jarUpdatedAt" | "nav"> & {
   nav?: Record<string, string>;
+  jarUpdatedAt?: number;
 };
 
 export interface ResourceItem {
