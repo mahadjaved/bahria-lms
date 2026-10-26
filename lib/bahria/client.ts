@@ -10,7 +10,7 @@ import {
   UnauthorizedError, type AttendanceCourse, type AttendanceResult, type PortalLink, type PortalPage,
   type SessionData, type TimetableResult
 } from "./types";
-import { createSession, saveSession, withSessionLock } from "./store";
+import { createSession, getStoredSession, saveSession, withSessionLock } from "./store";
 
 /**
  * ALL portal traffic goes through ONE Chrome-impersonating HTTP client.
@@ -53,6 +53,7 @@ export interface FetchResult { status: number; url: string; html: string; jar: C
  */
 export async function fetchWithJar(jar: CookieJar, url: string, init: { method?: string; body?: string; headers?: Record<string, string> } = {}, maxRedirects = 10): Promise<FetchResult> {
   let currentUrl = url; let method = init.method || "GET"; let body = init.body;
+  const hadJar = jar.size > 0;
   for (let i = 0; i <= maxRedirects; i++) {
     const res = await http().fetch(currentUrl, {
       method: method as "GET" | "POST", body: method === "GET" ? undefined : body, redirect: "manual",
@@ -61,7 +62,19 @@ export async function fetchWithJar(jar: CookieJar, url: string, init: { method?:
     storeCookies(jar, res);
     if ([301, 302, 303, 307, 308].includes(res.status)) {
       const loc = res.headers.get("location"); if (!loc) return { status: res.status, url: currentUrl, html: await res.text(), jar };
-      currentUrl = new URL(loc, currentUrl).toString();
+      const next = new URL(loc, currentUrl);
+      // NEVER actually request Logoff.aspx: following that redirect EXECUTES
+      // a real portal logoff and burns the session for every other page.
+      // A redirect there just means "this session is dead" — surface it as a
+      // synthetic result (no request made) and let assertLoggedIn report an
+      // expired session. Same for Login.aspx once we hold a live jar: the
+      // portal only sends authenticated traffic there when the session died,
+      // and rendering it gains nothing. (The anonymous login flow itself is
+      // unaffected: it starts with an empty jar and GETs Login.aspx directly.)
+      if (/\/Logoff\.aspx$/i.test(next.pathname) || (hadJar && /\/Login\.aspx$/i.test(next.pathname))) {
+        return { status: res.status, url: next.toString(), html: "", jar };
+      }
+      currentUrl = next.toString();
       if (res.status === 303 || ((res.status === 301 || res.status === 302) && method === "POST")) { method = "GET"; body = undefined; }
       continue;
     }
@@ -119,34 +132,38 @@ export function classifyNavLinks(links: PortalLink[]): Partial<Record<PortalFeat
   return found;
 }
 
-async function discoverNavInternal(session: SessionData, jar: CookieJar, seedHtml?: string, seedUrl?: string) {
-  const nav: Record<string, string> = { ...session.nav };
-  const consider = (html: string, url: string) => {
-    const page = parsePortalPage(html, url);
-    const found = classifyNavLinks(page.links);
-    for (const [k, v] of Object.entries(found)) if (v && !nav[k]) nav[k] = v;
-    if (!session.name) session.name = extractStudentName(html);
-  };
-  if (seedHtml && seedUrl) consider(seedHtml, seedUrl);
-  const candidates = ["/Sys/Student/Dashboard.aspx", "/Sys/Common/Dashboard.aspx", "/Sys/Student/Home.aspx", "/Sys/Student/Default.aspx"];
-  let fetched = 0;
-  for (const c of candidates) {
-    if (fetched >= 2 || Object.keys(nav).length >= 6) break;
-    try {
-      const r = await fetchWithJar(jar, BAHRIA_BASE_URL + c);
-      if (r.url.includes("Login.aspx")) break;
-      consider(r.html, r.url);
-      fetched++;
-    } catch { break; }
+/**
+ * Cheap nav absorption: classify the links of a page the app already
+ * fetched for a real feature and fill any nav gaps. NO extra requests —
+ * discovery must never crawl guessed URLs (a wrong guess can redirect
+ * toward Logoff.aspx and, worse, taught us nothing the verified paths
+ * don't already cover). The login landing page is the seed; every real
+ * feature page response feeds this too.
+ */
+function absorbNavLinks(session: SessionData, page: PortalPage) {
+  const found = classifyNavLinks(page.links);
+  let changed = false;
+  for (const [k, v] of Object.entries(found)) {
+    if (v && !session.nav[k]) { session.nav[k] = v; changed = true; }
   }
-  session.nav = nav;
+  if (changed) session.navDiscoveredAt = Date.now();
+}
+
+async function discoverNavInternal(session: SessionData, seedHtml?: string, seedUrl?: string) {
+  if (seedHtml && seedUrl) {
+    absorbNavLinks(session, parsePortalPage(seedHtml, seedUrl));
+    if (!session.name) session.name = extractStudentName(seedHtml);
+  }
   session.navDiscoveredAt = Date.now();
 }
 
-async function ensureNavInternal(session: SessionData, jar: CookieJar) {
+async function ensureNavInternal(session: SessionData) {
   const stale = !session.navDiscoveredAt || Date.now() - session.navDiscoveredAt > 60 * 60 * 1000;
   if (Object.keys(session.nav).length === 0 || stale) {
-    await discoverNavInternal(session, jar);
+    // Seed-only now: with no fresh page in hand there is nothing safe to
+    // fetch (no guessed-URL crawling). Real feature fetches re-absorb the
+    // menu via absorbNavLinks as a side effect.
+    await discoverNavInternal(session);
   }
 }
 
@@ -188,13 +205,29 @@ async function doPostback(jar: CookieJar, info: WebFormInfo, attempt: PostbackAt
   return fetchWithJar(jar, info.action, { method: "POST", body: form.toString() });
 }
 
-async function fetchWithPostbacks(jar: CookieJar, url: string, budget: { n: number }): Promise<PortalPage> {
+/**
+ * Fetch one candidate URL for a feature. Returns the parsed page AND the
+ * HTTP status of the (final) GET, so callers can apply the accept rule:
+ * a 200 is the real page — accept it as-is, even with zero data tables
+ * (the dashboard legitimately has none). Only 404/transport failures and
+ * login bounces (assertLoggedIn) move the caller to the next candidate.
+ *
+ * WebForms postbacks run ONLY when all of these hold: the GET returned
+ * 200, the page has zero data rows, its form actually has selects/buttons,
+ * and the feature is not dashboard/profile (those never need a postback;
+ * replaying forms there is how stray requests wander toward Logoff).
+ */
+async function fetchWithPostbacks(
+  jar: CookieJar, url: string, budget: { n: number }, feature: PortalFeature
+): Promise<{ page: PortalPage; status: number }> {
   const first = await fetchWithJar(jar, url); budget.n++;
   assertLoggedIn(first);
   let best = parsePortalPage(first.html, first.url);
-  if (pageHasData(best)) return best;
+  if (first.status !== 200) return { page: best, status: first.status };
+  if (pageHasData(best)) return { page: best, status: 200 };
+  if (feature === "dashboard" || feature === "profile") return { page: best, status: 200 };
   const info = analyzeWebForm(first.html, first.url);
-  if (!info) return best;
+  if (!info || (info.selects.length === 0 && !pickActionButton(info))) return { page: best, status: 200 };
   for (const attempt of buildAttempts(info)) {
     if (budget.n >= 12) break;
     try {
@@ -202,10 +235,10 @@ async function fetchWithPostbacks(jar: CookieJar, url: string, budget: { n: numb
       assertLoggedIn(res);
       const page = parsePortalPage(res.html, res.url);
       if (pageScore(page) > pageScore(best)) best = page;
-      if (pageHasData(page)) return page;
+      if (pageHasData(page)) return { page, status: 200 };
     } catch (e) { if (e instanceof UnauthorizedError) throw e; }
   }
-  return best;
+  return { page: best, status: 200 };
 }
 
 /* ------------------------------------------------------------------ */
@@ -219,16 +252,24 @@ async function getPortalPageInternal(jar: CookieJar, path: string): Promise<Port
 }
 
 async function getFeaturePageInternal(session: SessionData, jar: CookieJar, feature: PortalFeature): Promise<PortalPage> {
-  await ensureNavInternal(session, jar);
+  await ensureNavInternal(session);
   const candidates = featureCandidates(session, feature);
   const budget = { n: 0 };
   let richest: PortalPage | null = null;
   let lastError: unknown = null;
+  // Candidates are ordered verified-path, discovered-URL, guesses. The
+  // FIRST candidate that answers HTTP 200 is accepted as the feature's
+  // page — even with no data tables (the dashboard has none; a section can
+  // legitimately be empty). Guessed fallbacks are consulted only on
+  // 404/transport failure; a login bounce throws immediately. Crawling
+  // guesses past a healthy 200 wasted requests and risked wandering into
+  // a portal logoff.
   for (const url of candidates) {
     if (budget.n >= 12) break;
     try {
-      const page = await fetchWithPostbacks(jar, url, budget);
-      if (pageHasData(page)) return page;
+      const { page, status } = await fetchWithPostbacks(jar, url, budget, feature);
+      absorbNavLinks(session, page);
+      if (status === 200) return page;
       if (!richest || pageScore(page) > pageScore(richest)) richest = page;
     } catch (e) {
       lastError = e;
@@ -239,9 +280,9 @@ async function getFeaturePageInternal(session: SessionData, jar: CookieJar, feat
   throw lastError instanceof Error ? lastError : new Error("Could not load page from Bahria portal");
 }
 
-/** GET the first candidate that yields a parsed page (verified pages need no postbacks). */
+/** GET the first candidate that yields an HTTP 200 page (verified pages need no postbacks). */
 async function fetchCandidatePage(session: SessionData, jar: CookieJar, feature: PortalFeature): Promise<{ page: PortalPage; html: string; url: string }> {
-  await ensureNavInternal(session, jar);
+  await ensureNavInternal(session);
   let richest: { page: PortalPage; html: string; url: string } | null = null;
   let lastError: unknown = null;
   for (const url of featureCandidates(session, feature)) {
@@ -249,7 +290,8 @@ async function fetchCandidatePage(session: SessionData, jar: CookieJar, feature:
       const r = await fetchWithJar(jar, url);
       assertLoggedIn(r);
       const page = parsePortalPage(r.html, r.url);
-      if (pageHasData(page)) return { page, html: r.html, url: r.url };
+      absorbNavLinks(session, page);
+      if (r.status === 200) return { page, html: r.html, url: r.url };
       if (!richest || pageScore(page) > pageScore(richest.page)) richest = { page, html: r.html, url: r.url };
     } catch (e) {
       lastError = e;
@@ -324,7 +366,7 @@ async function getAttendanceInternal(session: SessionData, jar: CookieJar): Prom
 /* ---------------- Timetable: schedule JSON in a hidden field ---------------- */
 
 async function getTimetableInternal(session: SessionData, jar: CookieJar): Promise<TimetableResult> {
-  await ensureNavInternal(session, jar);
+  await ensureNavInternal(session);
   let richest: PortalPage | null = null;
   let lastError: unknown = null;
   for (const url of featureCandidates(session, "timetable")) {
@@ -333,7 +375,11 @@ async function getTimetableInternal(session: SessionData, jar: CookieJar): Promi
       assertLoggedIn(r);
       const calendar = extractCalendarJson(r.html);
       const page = parsePortalPage(r.html, r.url);
-      if (calendar) return { page, calendar };
+      absorbNavLinks(session, page);
+      // Accept the first HTTP 200 (the verified TimeTable page): its
+      // schedule JSON either parses or it doesn't — guessed fallbacks
+      // would serve a different page, not a better timetable.
+      if (r.status === 200) return { page, calendar };
       if (!richest || pageScore(page) > pageScore(richest)) richest = page;
     } catch (e) {
       lastError = e;
@@ -350,11 +396,28 @@ async function getTimetableInternal(session: SessionData, jar: CookieJar): Promi
 /* ------------------------------------------------------------------ */
 
 async function runWithJar<T>(session: SessionData, fn: (jar: CookieJar) => Promise<T>): Promise<T> {
+  // Runs under the per-session lock: the previous lock holder has already
+  // saved its jar, so if the store copy is fresher than the snapshot this
+  // request was authorized with (e.g. a parallel request from the same
+  // cookie), adopt the store's jar/nav before touching the portal.
+  const stored = getStoredSession(session.id);
+  if (stored && stored !== session && (stored.jarUpdatedAt || 0) > (session.jarUpdatedAt || 0)) {
+    session.cookies = stored.cookies;
+    session.nav = stored.nav;
+    session.jarUpdatedAt = stored.jarUpdatedAt;
+    if (stored.navDiscoveredAt) session.navDiscoveredAt = stored.navDiscoveredAt;
+  }
   const jar = jarFromRecord(session.cookies);
+  const before = JSON.stringify(session.cookies);
   try {
     return await fn(jar);
   } finally {
-    session.cookies = jarToRecord(jar);
+    const next = jarToRecord(jar);
+    session.cookies = next;
+    // Stamp the jar's freshness whenever it actually changed: this is the
+    // clock the cookie<->store merge in session-server.ts compares, and it
+    // is what gets written back into the browser cookie by the API layer.
+    if (JSON.stringify(next) !== before) session.jarUpdatedAt = Date.now();
     saveSession(session);
   }
 }
@@ -382,7 +445,7 @@ export async function getTimetable(session: SessionData): Promise<TimetableResul
 
 export async function ensureNav(session: SessionData): Promise<Record<string, string>> {
   return withJar(session, async (jar) => {
-    await ensureNavInternal(session, jar);
+    await ensureNavInternal(session);
     return session.nav;
   });
 }
@@ -403,7 +466,10 @@ export async function loginToBahria(input: { enrollment: string; password: strin
   form.set("ctl00$BodyPH$ddlInstituteID", input.instituteId);
   form.set("ctl00$BodyPH$ddlSubUserType", input.subUserType);
   const posted = await fetchWithJar(jar, loginUrl, { method: "POST", body: form.toString() });
-  const stillOnLogin = posted.url.includes("Login.aspx");
+  // fetchWithJar no longer FOLLOWS redirects into Logoff.aspx/Login.aspx (it
+  // returns the target as a synthetic URL instead), so a session killed at
+  // PrepareSession surfaces here as a Logoff URL — that is a failed login.
+  const stillOnLogin = posted.url.includes("Login.aspx") || posted.url.includes("Logoff.aspx");
   if (stillOnLogin) {
     const err = extractErrorText(posted.html);
     throw new Error(err || "Login failed. Check your enrollment, password, institute and account type.");
@@ -425,7 +491,7 @@ export async function loginToBahria(input: { enrollment: string; password: strin
   // Discover the real menu URLs from the authenticated landing page now,
   // while we know the jar is fresh — used as a bonus after verified paths.
   try {
-    await discoverNavInternal(session, jar, posted.html, posted.url);
+    await discoverNavInternal(session, posted.html, posted.url);
   } catch { /* discovery is best-effort; it retries lazily on first use */ }
   session.cookies = jarToRecord(jar);
   saveSession(session);
