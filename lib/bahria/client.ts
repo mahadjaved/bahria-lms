@@ -1,6 +1,6 @@
-import * as cheerio from "cheerio";
 import { Impit } from "impit";
-import { BAHRIA_BASE_URL, LOGIN_PATH } from "./constants";
+import { CookieJar as ScopedCookieJar } from "tough-cookie";
+import { BAHRIA_BASE_URL, LMS_BASE_URL, LOGIN_PATH } from "./constants";
 import { PORTAL_PATHS, type PortalFeature } from "./paths";
 import {
   parsePortalPage, extractHiddenFields, extractErrorText, extractStudentName, extractCalendarJson,
@@ -10,7 +10,7 @@ import {
   UnauthorizedError, type AttendanceCourse, type AttendanceResult, type PortalLink, type PortalPage,
   type SessionData, type TimetableResult
 } from "./types";
-import { createSession, getStoredSession, saveSession, withSessionLock } from "./store";
+import { createSession, getStoredSession, isRevokedSession, saveSession, withSessionLock } from "./store";
 
 /**
  * ALL portal traffic goes through ONE Chrome-impersonating HTTP client.
@@ -30,17 +30,34 @@ function http(): Impit {
 
 const CHROME_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
-export type CookieJar = Map<string, string>;
-export function jarFromRecord(rec: Record<string, string>): CookieJar { return new Map(Object.entries(rec)); }
-export function jarToRecord(jar: CookieJar): Record<string, string> { return Object.fromEntries(jar); }
-function cookieHeader(jar: CookieJar): string { return [...jar.entries()].map(([k, v]) => `${k}=${v}`).join("; "); }
-function storeCookies(jar: CookieJar, res: { headers: Headers }) {
-  const setCookies: string[] = (res.headers as unknown as { getSetCookie?: () => string[] }).getSetCookie
-    ? (res.headers as unknown as { getSetCookie: () => string[] }).getSetCookie()
-    : [];
-  for (const sc of setCookies) {
-    const pair = sc.split(";")[0]; const idx = pair.indexOf("=");
-    if (idx > 0) jar.set(pair.slice(0, idx).trim(), pair.slice(idx + 1).trim());
+export type CookieJar = ScopedCookieJar;
+const JAR_KEY = "__scopedJar";
+export function jarFromRecord(rec: Record<string, string>): CookieJar {
+  if (rec[JAR_KEY]) return ScopedCookieJar.deserializeSync(JSON.parse(rec[JAR_KEY]));
+  // Older sessions stored unscoped cookies. Restrict them to the CMS host;
+  // the LMS session can be re-established through GoToLMS.
+  const jar = new ScopedCookieJar();
+  for (const [name, value] of Object.entries(rec)) {
+    jar.setCookieSync(`${name}=${value}; Path=/`, BAHRIA_BASE_URL, { ignoreError: true });
+  }
+  return jar;
+}
+export function jarToRecord(jar: CookieJar): Record<string, string> {
+  return { [JAR_KEY]: JSON.stringify(jar.serializeSync()) };
+}
+function storeCookies(jar: CookieJar, res: { headers: Headers }, url: string) {
+  const headers = res.headers as Headers & { getSetCookie?: () => string[] };
+  for (const cookie of headers.getSetCookie?.() || []) {
+    jar.setCookieSync(cookie, url, { ignoreError: true });
+  }
+}
+
+/** Do not forward a student's cookies or form data to arbitrary redirects. */
+function assertAllowedPortalUrl(url: string) {
+  const target = new URL(url);
+  const allowed = [new URL(BAHRIA_BASE_URL).origin, new URL(LMS_BASE_URL).origin];
+  if (!allowed.includes(target.origin) || target.username || target.password) {
+    throw new Error("Portal redirected to an untrusted address");
   }
 }
 
@@ -53,13 +70,14 @@ export interface FetchResult { status: number; url: string; html: string; jar: C
  */
 export async function fetchWithJar(jar: CookieJar, url: string, init: { method?: string; body?: string; headers?: Record<string, string> } = {}, maxRedirects = 10): Promise<FetchResult> {
   let currentUrl = url; let method = init.method || "GET"; let body = init.body;
-  const hadJar = jar.size > 0;
+  const hadJar = jar.getCookiesSync(url).length > 0;
   for (let i = 0; i <= maxRedirects; i++) {
+    assertAllowedPortalUrl(currentUrl);
     const res = await http().fetch(currentUrl, {
       method: method as "GET" | "POST", body: method === "GET" ? undefined : body, redirect: "manual",
-      headers: { "User-Agent": CHROME_UA, ...(init.headers || {}), Cookie: cookieHeader(jar), ...(method !== "GET" ? { "Content-Type": "application/x-www-form-urlencoded" } : {}) }
+      headers: { "User-Agent": CHROME_UA, ...(init.headers || {}), Cookie: jar.getCookieStringSync(currentUrl), ...(method !== "GET" ? { "Content-Type": "application/x-www-form-urlencoded" } : {}) }
     });
-    storeCookies(jar, res);
+    storeCookies(jar, res, currentUrl);
     if ([301, 302, 303, 307, 308].includes(res.status)) {
       const loc = res.headers.get("location"); if (!loc) return { status: res.status, url: currentUrl, html: await res.text(), jar };
       const next = new URL(loc, currentUrl);
@@ -84,7 +102,7 @@ export async function fetchWithJar(jar: CookieJar, url: string, init: { method?:
 }
 
 function assertLoggedIn(result: FetchResult) {
-  if (result.url.includes("Login.aspx") || result.url.includes("Logoff.aspx")) {
+  if (/\/(?:Login|Logoff)\.aspx(?:[?#]|$)/i.test(result.url) || /name=["']ctl00\$BodyPH\$tbPassword["']/i.test(result.html)) {
     throw new UnauthorizedError("Bahria session expired. Please log in again.");
   }
 }
@@ -233,6 +251,7 @@ async function fetchWithPostbacks(
     try {
       const res = await doPostback(jar, info, attempt); budget.n++;
       assertLoggedIn(res);
+      if (res.status !== 200) throw new Error(`Bahria portal returned HTTP ${res.status}`);
       const page = parsePortalPage(res.html, res.url);
       if (pageScore(page) > pageScore(best)) best = page;
       if (pageHasData(page)) return { page, status: 200 };
@@ -248,6 +267,7 @@ async function fetchWithPostbacks(
 async function getPortalPageInternal(jar: CookieJar, path: string): Promise<PortalPage> {
   const result = await fetchWithJar(jar, resolveUrl(path));
   assertLoggedIn(result);
+  if (result.status !== 200) throw new Error(`Bahria portal returned HTTP ${result.status}`);
   return parsePortalPage(result.html, result.url);
 }
 
@@ -255,7 +275,6 @@ async function getFeaturePageInternal(session: SessionData, jar: CookieJar, feat
   await ensureNavInternal(session);
   const candidates = featureCandidates(session, feature);
   const budget = { n: 0 };
-  let richest: PortalPage | null = null;
   let lastError: unknown = null;
   // Candidates are ordered verified-path, discovered-URL, guesses. The
   // FIRST candidate that answers HTTP 200 is accepted as the feature's
@@ -270,20 +289,18 @@ async function getFeaturePageInternal(session: SessionData, jar: CookieJar, feat
       const { page, status } = await fetchWithPostbacks(jar, url, budget, feature);
       absorbNavLinks(session, page);
       if (status === 200) return page;
-      if (!richest || pageScore(page) > pageScore(richest)) richest = page;
+      lastError = new Error(`Bahria portal returned HTTP ${status}`);
     } catch (e) {
       lastError = e;
       if (e instanceof UnauthorizedError) throw e;
     }
   }
-  if (richest) return richest;
-  throw lastError instanceof Error ? lastError : new Error("Could not load page from Bahria portal");
+  throw lastError instanceof Error ? lastError : new Error("Bahria portal could not load this page");
 }
 
 /** GET the first candidate that yields an HTTP 200 page (verified pages need no postbacks). */
 async function fetchCandidatePage(session: SessionData, jar: CookieJar, feature: PortalFeature): Promise<{ page: PortalPage; html: string; url: string }> {
   await ensureNavInternal(session);
-  let richest: { page: PortalPage; html: string; url: string } | null = null;
   let lastError: unknown = null;
   for (const url of featureCandidates(session, feature)) {
     try {
@@ -292,14 +309,13 @@ async function fetchCandidatePage(session: SessionData, jar: CookieJar, feature:
       const page = parsePortalPage(r.html, r.url);
       absorbNavLinks(session, page);
       if (r.status === 200) return { page, html: r.html, url: r.url };
-      if (!richest || pageScore(page) > pageScore(richest.page)) richest = { page, html: r.html, url: r.url };
+      lastError = new Error(`Bahria portal returned HTTP ${r.status}`);
     } catch (e) {
       lastError = e;
       if (e instanceof UnauthorizedError) throw e;
     }
   }
-  if (richest) return richest;
-  throw lastError instanceof Error ? lastError : new Error("Could not load page from Bahria portal");
+  throw lastError instanceof Error ? lastError : new Error("Bahria portal could not load this page");
 }
 
 /* ---------------- Attendance: course table -> per-course Detail pages ---------------- */
@@ -311,25 +327,18 @@ function num(s: string | undefined): number {
 
 async function getAttendanceInternal(session: SessionData, jar: CookieJar): Promise<AttendanceResult> {
   const { page, html } = await fetchCandidatePage(session, jar, "attendance");
-  // The course table's rows each carry a "Detail" anchor to
-  // AttendanceSummary.aspx?v=<encrypted>. Collect them in document order —
-  // they pair with the main table's rows in the same order.
-  const $ = cheerio.load(html);
-  const detailUrls: string[] = [];
-  $('a[href*="AttendanceSummary.aspx"]').each((_, a) => {
-    const href = $(a).attr("href") || "";
-    try { detailUrls.push(new URL(href, page.url).toString()); } catch { /* skip */ }
-  });
+  // Use links on each parsed row so missing detail links do not shift courses.
   const mainTable = page.tables.find((t) => t.rows.length > 0) || null;
   const courses: AttendanceCourse[] = [];
   if (mainTable) {
     for (let i = 0; i < mainTable.rows.length && courses.length < 15; i++) {
       const row = mainTable.rows[i];
-      const detailUrl = detailUrls[i] || mainTable.rowLinks?.[i] || null;
+      const detailUrl = mainTable.cellLinks?.[i]?.find((link) => link && /AttendanceSummary\.aspx/i.test(link)) || mainTable.rowLinks?.[i] || null;
       if (!detailUrl || !detailUrl.includes("AttendanceSummary.aspx")) continue;
       try {
         const r = await fetchWithJar(jar, detailUrl);
         assertLoggedIn(r);
+        if (r.status !== 200) throw new Error(`Bahria portal returned HTTP ${r.status}`);
         const detail = parsePortalPage(r.html, r.url);
         const sessions = detail.tables.find((t) => t.headers.some((h) => /class date/i.test(h)))
           || detail.tables[1] || null;
@@ -357,7 +366,10 @@ async function getAttendanceInternal(session: SessionData, jar: CookieJar): Prom
           percentage,
           sessions
         });
-      } catch (e) { if (e instanceof UnauthorizedError) throw e; }
+      } catch (e) {
+        if (e instanceof UnauthorizedError) throw e;
+        throw new Error("Could not load attendance details from Bahria portal");
+      }
     }
   }
   return { page, courses };
@@ -367,7 +379,6 @@ async function getAttendanceInternal(session: SessionData, jar: CookieJar): Prom
 
 async function getTimetableInternal(session: SessionData, jar: CookieJar): Promise<TimetableResult> {
   await ensureNavInternal(session);
-  let richest: PortalPage | null = null;
   let lastError: unknown = null;
   for (const url of featureCandidates(session, "timetable")) {
     try {
@@ -380,13 +391,12 @@ async function getTimetableInternal(session: SessionData, jar: CookieJar): Promi
       // schedule JSON either parses or it doesn't — guessed fallbacks
       // would serve a different page, not a better timetable.
       if (r.status === 200) return { page, calendar };
-      if (!richest || pageScore(page) > pageScore(richest)) richest = page;
+      lastError = new Error(`Bahria portal returned HTTP ${r.status}`);
     } catch (e) {
       lastError = e;
       if (e instanceof UnauthorizedError) throw e;
     }
   }
-  if (richest) return { page: richest, calendar: null };
   throw lastError instanceof Error ? lastError : new Error("Could not load timetable from Bahria portal");
 }
 
@@ -400,8 +410,10 @@ async function runWithJar<T>(session: SessionData, fn: (jar: CookieJar) => Promi
   // saved its jar, so if the store copy is fresher than the snapshot this
   // request was authorized with (e.g. a parallel request from the same
   // cookie), adopt the store's jar/nav before touching the portal.
+  if (isRevokedSession(session.id)) throw new UnauthorizedError();
   const stored = getStoredSession(session.id);
-  if (stored && stored !== session && (stored.jarUpdatedAt || 0) > (session.jarUpdatedAt || 0)) {
+  if (!stored) throw new UnauthorizedError();
+  if (stored !== session && (stored.jarUpdatedAt || 0) > (session.jarUpdatedAt || 0)) {
     session.cookies = stored.cookies;
     session.nav = stored.nav;
     session.jarUpdatedAt = stored.jarUpdatedAt;
@@ -414,10 +426,8 @@ async function runWithJar<T>(session: SessionData, fn: (jar: CookieJar) => Promi
   } finally {
     const next = jarToRecord(jar);
     session.cookies = next;
-    // Stamp the jar's freshness whenever it actually changed: this is the
-    // clock the cookie<->store merge in session-server.ts compares, and it
-    // is what gets written back into the browser cookie by the API layer.
-    if (JSON.stringify(next) !== before) session.jarUpdatedAt = Date.now();
+    // A monotonic timestamp lets queued snapshots adopt the latest jar.
+    if (JSON.stringify(next) !== before) session.jarUpdatedAt = Math.max(Date.now(), session.jarUpdatedAt + 1);
     saveSession(session);
   }
 }
@@ -452,9 +462,10 @@ export async function ensureNav(session: SessionData): Promise<Record<string, st
 
 export interface LoginResult { session: SessionData; }
 export async function loginToBahria(input: { enrollment: string; password: string; instituteId: string; subUserType: string }): Promise<LoginResult> {
-  const jar: CookieJar = new Map();
+  const jar: CookieJar = new ScopedCookieJar();
   const loginUrl = BAHRIA_BASE_URL + LOGIN_PATH;
   const first = await fetchWithJar(jar, loginUrl);
+  if (first.status !== 200) throw new Error(`Bahria login returned HTTP ${first.status}`);
   const hidden = extractHiddenFields(first.html);
   const form = new URLSearchParams();
   for (const [k, v] of Object.entries(hidden)) form.set(k, v);
@@ -469,11 +480,12 @@ export async function loginToBahria(input: { enrollment: string; password: strin
   // fetchWithJar no longer FOLLOWS redirects into Logoff.aspx/Login.aspx (it
   // returns the target as a synthetic URL instead), so a session killed at
   // PrepareSession surfaces here as a Logoff URL — that is a failed login.
-  const stillOnLogin = posted.url.includes("Login.aspx") || posted.url.includes("Logoff.aspx");
+  const stillOnLogin = /\/(?:Login|Logoff)\.aspx(?:[?#]|$)/i.test(posted.url) || /name=["']ctl00\$BodyPH\$tbPassword["']/i.test(posted.html);
   if (stillOnLogin) {
     const err = extractErrorText(posted.html);
     throw new Error(err || "Login failed. Check your enrollment, password, institute and account type.");
   }
+  if (posted.status !== 200) throw new Error(`Bahria login returned HTTP ${posted.status}`);
   // Establish the LMS (lms.bahria.edu.pk) session inside the same jar NOW:
   // GoToLMS redirects to the LMS dashboard and sets the LMS cookies.
   try {

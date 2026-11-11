@@ -4,24 +4,8 @@ import path from "path";
 import { SESSION_TTL_MS } from "./session";
 import type { SessionData, SessionSeed } from "./types";
 
-/**
- * Server-side session store — now a per-process CACHE, not the authority.
- *
- * History: v1 kept the jar only in the browser cookie but never wrote
- * refreshes back (Aspire rotates its session cookie, so the browser's stale
- * jar got users bounced to Login within seconds). v2 kept the jar only
- * here — which fixed rotation but broke whenever a request landed on a
- * different process/instance than the login (dev workers, restarts,
- * serverless): the store simply didn't have the session and the app
- * reported "logged out" mid-browsing.
- *
- * Current design: the encrypted browser cookie is the authoritative
- * carrier and is re-issued with the freshest jar on EVERY API response
- * (see session.ts + api-helpers.ts `withSessionCookie`). This store stays
- * as a cache (merged with the cookie payload on read — larger
- * `jarUpdatedAt` wins) and as the per-session request lock. Sessions also
- * persist to .data/sessions.json (gitignored) as a best-effort extra.
- */
+/** Server-side session state and per-session request locks. Run on one
+ * persistent instance: the in-memory lock is not shared between processes. */
 
 const DATA_DIR = path.join(process.cwd(), ".data");
 const DATA_FILE = path.join(DATA_DIR, "sessions.json");
@@ -66,26 +50,19 @@ function store(): StoreShape {
 
 function persist() {
   try {
-    mkdirSync(DATA_DIR, { recursive: true });
-    writeFileSync(DATA_FILE, JSON.stringify([...store().sessions.values()]), "utf8");
+    mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
+    writeFileSync(DATA_FILE, JSON.stringify([...store().sessions.values()]), { encoding: "utf8", mode: 0o600 });
   } catch { /* best-effort only */ }
 }
 
 function persistRevoked() {
   try {
-    mkdirSync(DATA_DIR, { recursive: true });
+    mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
     writeFileSync(REVOKED_FILE, JSON.stringify([...store().revoked.entries()]), "utf8");
   } catch { /* best-effort only */ }
 }
 
-/**
- * Was this session id explicitly logged out? The session cookie is
- * self-contained, so without a denylist a replayed pre-logout cookie would
- * resurrect the session. The list is per-process (persisted to disk
- * best-effort): it restores the old store-only logout semantics wherever
- * the store lives; a cookie replayed to a never-involved instance can
- * still only live until its 12h TTL.
- */
+/** Revocations also reject encrypted cookies issued by older versions. */
 export function isRevokedSession(id: string | null | undefined): boolean {
   if (!id) return false;
   const s = store();
@@ -143,7 +120,6 @@ export function deleteSession(id: string | null | undefined) {
   if (!id) return;
   const s = store();
   if (s.sessions.delete(id)) persist();
-  s.chains.delete(id);
   // Record the revocation so a replayed copy of the (self-contained)
   // session cookie is refused too — see isRevokedSession.
   s.revoked.set(id, Date.now());
@@ -161,11 +137,13 @@ export async function withSessionLock<T>(id: string, fn: () => Promise<T>): Prom
   const prev = s.chains.get(id) || Promise.resolve();
   let release!: () => void;
   const current = new Promise<void>((resolve) => { release = resolve; });
-  s.chains.set(id, prev.then(() => current));
+  const chain = prev.then(() => current);
+  s.chains.set(id, chain);
   await prev.catch(() => undefined);
   try {
     return await fn();
   } finally {
     release();
+    if (s.chains.get(id) === chain) s.chains.delete(id);
   }
 }

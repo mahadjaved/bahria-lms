@@ -1,7 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getSession } from "@/lib/session-server";
 import { getPortalPage } from "@/lib/bahria/client";
-import { withSessionCookie } from "@/lib/api-helpers";
 import { UnauthorizedError, type SessionData } from "@/lib/bahria/types";
 export async function GET(req: NextRequest) {
   let session: SessionData | null = null;
@@ -11,12 +10,11 @@ export async function GET(req: NextRequest) {
     if (path.includes("..")) return NextResponse.json({ ok: false, error: "Invalid path" }, { status: 400 });
     session = getSession();
     const page = await getPortalPage(session, path);
-    return withSessionCookie(NextResponse.json({ ok: true, page }), session);
+    return NextResponse.json({ ok: true, page });
   } catch (e) {
     const res = e instanceof UnauthorizedError
       ? NextResponse.json({ ok: false, error: e.message }, { status: 401 })
       : NextResponse.json({ ok: false, error: e instanceof Error ? e.message : "Failed to fetch portal page" }, { status: 502 });
-    if (session) withSessionCookie(res, session);
     return res;
   }
 }

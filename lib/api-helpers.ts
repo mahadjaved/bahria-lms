@@ -3,18 +3,12 @@ import { getSession } from "./session-server";
 import { getFeaturePage, getAttendance, getTimetable, attendanceSummary } from "./bahria/client";
 import { getLmsFeature, type LmsKind } from "./bahria/lms";
 import type { PortalFeature } from "./bahria/paths";
-import { SESSION_COOKIE, SESSION_COOKIE_MAX_AGE, encryptSessionPayload, sessionToCookiePayload } from "./bahria/session";
+import { SESSION_COOKIE, SESSION_COOKIE_MAX_AGE, signSessionId } from "./bahria/session";
 import { UnauthorizedError, type SessionData } from "./bahria/types";
 
-/**
- * Re-issue the session cookie with the LIVE session state (freshest Bahria
- * cookie jar included). This write-back on EVERY response is what makes
- * the cookie-carried session work: Aspire rotates its cookies, and the
- * browser must always present the newest jar — whichever server process
- * or instance happens to serve the next request.
- */
-export function withSessionCookie(res: NextResponse, session: SessionData): NextResponse {
-  res.cookies.set(SESSION_COOKIE, encryptSessionPayload(sessionToCookiePayload(session)), {
+/** Set only on login, so late parallel responses cannot replace a newer session. */
+export function setSessionCookie(res: NextResponse, session: SessionData): NextResponse {
+  res.cookies.set(SESSION_COOKIE, signSessionId(session.id), {
     httpOnly: true, sameSite: "lax", secure: process.env.NODE_ENV === "production",
     path: "/", maxAge: SESSION_COOKIE_MAX_AGE
   });
@@ -26,23 +20,14 @@ function errorResponse(e: unknown) {
   return NextResponse.json({ ok: false, error: e instanceof Error ? e.message : "Failed to load data from Bahria portal" }, { status: 502 });
 }
 
-/**
- * Wrap a response builder: load the session, run, and ALWAYS write the
- * refreshed session cookie back when a session was loaded — on success
- * AND on error (a failed portal call may still have rotated the jar; and
- * for UnauthorizedError the session is by definition gone, but if a
- * session object exists the freshest state is still the truthful one).
- */
+/** Resolve the session and translate portal errors into API responses. */
 async function respond<T>(build: (session: SessionData) => Promise<T>): Promise<NextResponse> {
-  let session: SessionData | null = null;
   try {
-    session = getSession();
+    const session = getSession();
     const body = await build(session);
-    return withSessionCookie(NextResponse.json(body), session);
+    return NextResponse.json(body);
   } catch (e) {
-    const res = errorResponse(e);
-    if (session) withSessionCookie(res, session);
-    return res;
+    return errorResponse(e);
   }
 }
 

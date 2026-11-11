@@ -27,24 +27,26 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const [name, setName] = useState<string>("");
   const [enrollment, setEnrollment] = useState<string>("");
   const [checked, setChecked] = useState(false);
+  const [checkError, setCheckError] = useState("");
 
   useEffect(() => {
     if (pathname === "/login") { setChecked(true); return; }
     let cancelled = false;
-    // One transient failure (a blip, a cold instance, a slow portal) must
-    // not nuke the session UX — retry once after ~1s and only bounce to
-    // /login when the retry also fails.
     const check = async (isRetry: boolean) => {
       try {
-        const r = await fetch("/api/auth/me");
-        if (!r.ok) throw new Error("unauthenticated");
+        const r = await fetch("/api/auth/me", { cache: "no-store" });
+        if (r.status === 401) {
+          if (!cancelled) router.replace("/login");
+          return;
+        }
+        if (!r.ok) throw new Error("Session check failed");
         const d = await r.json();
         if (cancelled) return;
-        setName(d.user?.name || ""); setEnrollment(d.user?.enrollment || ""); setChecked(true);
+        setCheckError(""); setName(d.user?.name || ""); setEnrollment(d.user?.enrollment || ""); setChecked(true);
       } catch {
         if (cancelled) return;
         if (!isRetry) setTimeout(() => { void check(true); }, 1000);
-        else router.replace("/login");
+        else setCheckError("Could not check your session. Please reload the page.");
       }
     };
     void check(false);
@@ -53,7 +55,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
   async function logout() { await fetch("/api/auth/logout", { method: "POST" }); router.replace("/login"); }
   if (pathname === "/login") return <>{children}</>;
-  if (!checked) return <div className="p-8 text-sm text-muted-foreground">Loading…</div>;
+  if (!checked) return <div className="p-8 text-sm text-muted-foreground">{checkError || "Loading…"}</div>;
 
   const nav = (
     <nav className="space-y-1 p-3">

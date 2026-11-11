@@ -29,7 +29,7 @@ Confirmed against the live portal with a real student login. CMS pages are simpl
 | Marks (provisional result) | `cms…/Sys/Student/Exams/ExamResult.aspx` |
 | Timetable | `cms…/Sys/Student/CourseRegistration/TimeTable.aspx` — **no HTML table**: the schedule is JSON in the hidden field `BodyPH_hfCalendarJson` (`eventsData`, `timeSlots`, `resources`, …) |
 | Fee challans | `cms…/Sys/Student/FeeManagement/FeeChallans` — **extensionless**, no `.aspx` |
-| LMS entry | `cms…/Sys/Common/GoToLMS.aspx` → redirects to `lms…/Student/Dashboard.php` (same cookie jar) |
+| LMS entry | `cms…/Sys/Common/GoToLMS.aspx` → redirects to `lms…/Student/Dashboard.php` (domain-scoped cookie jar) |
 | Lecture notes | `lms…/Student/LectureNotes.php` (+ `CourseOutline.php`, `CoursePlan.php` shown on the same page) |
 | Assignments | `lms…/Student/Assignments.php` |
 | Quizzes | `lms…/Student/Quizzes.php` |
@@ -51,9 +51,9 @@ Your password is **never stored**. It is used only for that one login POST to Ba
 
 ## Sessions & deployment
 
-The session **travels with the browser**: after login, the whole session (including the live Bahria cookie jar) is AES-256-GCM-encrypted into the `bahria_session` cookie, and every API response re-issues that cookie with the freshest jar. That write-back is essential — Aspire **rotates its session cookie after login**, so a jar snapshotted once at login goes stale within seconds (the original design's bug). A server-side store (`lib/bahria/store.ts`, persisted to `.data/sessions.json`) remains as a per-process cache and request lock, and is merged with the cookie on every read — whichever side has the fresher jar wins. Explicit logout revokes the session id server-side, so a replayed pre-logout cookie is refused. Sessions expire after 12 hours of inactivity (sliding). Your portal password is never stored — it is used only for the login POST itself.
+The browser holds a small signed session ID; the current CMS/LMS cookies stay on the server in a domain- and path-scoped jar. Portal requests for a session are serialized so cookie rotations are not lost, and ordinary API responses do not rewrite the browser cookie (which avoids out-of-order responses restoring stale sessions). Sessions expire after 12 hours of inactivity. Explicit logout deletes the session and revokes its ID. Your portal password is used only for the login POST and is never stored.
 
-**Deployment note:** run the app as a **single server process** (the normal local / single-instance setup — fully verified end-to-end). Bahria's WAF binds a CMS session to the authenticated channel of the process that performed the login: a *different* backend process presenting the same cookies is bounced to the login page by the portal itself, no matter what the client sends. So on multi-instance/serverless hosting, keep this app on one sticky instance; splitting requests across instances will log users out of CMS sections (courses, attendance, marks…). LMS sections (assignments, quizzes, materials, announcements) are not bound this way. This is a portal constraint, not an app bug — the cookie-carried session ensures the app itself never loses a session that the portal still honors.
+**Deployment:** use a single persistent server process. The in-memory lock and session store are not shared between processes or serverless instances, and Bahria may bind sessions to the login process. The store is also written to `.data/sessions.json` to survive a restart; it contains sensitive portal cookies in plaintext, so keep the directory private, persistent, and off shared/untrusted storage. Existing encrypted browser sessions are accepted for migration when still valid. After updating, sign in again if your old session has expired.
 
 ## Architecture
 
@@ -73,10 +73,10 @@ lib/bahria/
   constants.ts           Base URLs, 15 institutes, sub-user types
   paths.ts               Verified portal paths per feature (+ fallbacks)
   client.ts              impit (Chrome) client, cookie jar, WebForms login, CMS fetchers
-  lms.ts                 LMS select+POST-per-course harvester
+  lms.ts                 LMS select+GET-per-course harvester
   parser.ts              HTML -> headings / data tables / links, timetable JSON extraction
-  store.ts               Server-side session cache + per-session lock, logout revocations
-  session.ts             AES-256-GCM session-cookie payload (the session carrier)
+  store.ts               Server-side session store + per-session lock, logout revocations
+  session.ts             Signed session IDs and legacy encrypted-cookie migration
 components/ui/           shadcn/ui components (button, card, table, input, ...)
 components/app-shell.tsx Sidebar (desktop) / sheet menu (mobile), top bar, theme toggle, logout
 ```
@@ -93,7 +93,7 @@ npm run dev
 
 | Variable | Required | Description |
 |---|---|---|
-| `SESSION_SECRET` | Yes in production | Long random string used to sign the session-id cookie. A clearly-marked insecure fallback exists for local development only — never use it in production. |
+| `SESSION_SECRET` | Yes in production | Long random string used to sign session IDs and decrypt legacy cookies. A clearly-marked insecure fallback exists for local development only — never use it in production. |
 | `BAHRIA_BASE_URL` | No | Defaults to `https://cms.bahria.edu.pk`. |
 
 Copy `.env.example` to `.env.local` and set a real secret:

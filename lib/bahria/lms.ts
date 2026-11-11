@@ -6,7 +6,7 @@ import { UnauthorizedError, type LmsFeatureResult, type LmsTableGroup, type Port
 
 /**
  * The LMS proper — https://lms.bahria.edu.pk, a PHP app reached from the CMS
- * via /Sys/Common/GoToLMS.aspx (same cookie jar works on both hosts; the LMS
+ * via /Sys/Common/GoToLMS.aspx (a scoped cookie jar is used for both hosts; the LMS
  * session is established at CMS login time in loginToBahria).
  *
  * How LMS feature pages really work (verified from the pages' own JS):
@@ -18,8 +18,8 @@ import { UnauthorizedError, type LmsFeatureResult, type LmsTableGroup, type Port
  *   GetCourses():      <page>?s=<semesterValue>&oc=<courseValue>
  * So per feature: GET the page, read the course options, then GET
  * ?s=…&oc=… once per course (cap 12) and parse the main data table of each
- * response, grouped by course. Option values are appended RAW, exactly as
- * a browser would (they arrive pre-encoded, e.g. "MjAyNjM%3D").
+ * response, grouped by course. Option values are encoded once, including
+ * values that arrive pre-encoded (e.g. "MjAyNjM%3D").
  */
 
 export type LmsKind = "assignments" | "quizzes" | "materials" | "announcements";
@@ -39,8 +39,11 @@ const HEADER_HINTS: Record<LmsKind, string[]> = {
   announcements: ["announcement", "title", "posted"]
 };
 
+function isLogin(result: FetchResult) {
+  return /\/(?:Login|Logoff)\.(?:aspx|php)(?:[?#]|$)/i.test(result.url);
+}
 function assertLmsLoggedIn(result: FetchResult) {
-  if (result.url.includes("Login.aspx") || result.url.includes("Logoff.aspx")) {
+  if (isLogin(result)) {
     throw new UnauthorizedError("Bahria session expired. Please log in again.");
   }
 }
@@ -48,10 +51,14 @@ function assertLmsLoggedIn(result: FetchResult) {
 /** GET an LMS URL; if the LMS session isn't established yet, establish it via the CMS and retry once. */
 async function lmsGet(jar: CookieJar, url: string): Promise<FetchResult> {
   const first = await fetchWithJar(jar, url);
-  if (!first.url.includes("Login.aspx") && !first.url.includes("Logoff.aspx")) return first;
+  if (!isLogin(first)) {
+    if (first.status !== 200) throw new Error(`LMS returned HTTP ${first.status}`);
+    return first;
+  }
   await fetchWithJar(jar, BAHRIA_BASE_URL + "/Sys/Common/GoToLMS.aspx");
   const retry = await fetchWithJar(jar, url);
   assertLmsLoggedIn(retry);
+  if (retry.status !== 200) throw new Error(`LMS returned HTTP ${retry.status}`);
   return retry;
 }
 
@@ -119,6 +126,12 @@ function pickMainTable(tables: PortalTable[], kind: LmsKind): PortalTable | null
   return best;
 }
 
+// Portal option values may already be percent-encoded. Encode exactly once.
+function queryValue(value: string): string {
+  try { return encodeURIComponent(decodeURIComponent(value)); }
+  catch { return encodeURIComponent(value); }
+}
+
 async function getLmsFeatureInternal(jar: CookieJar, kind: LmsKind): Promise<LmsFeatureResult> {
   const groups: LmsTableGroup[] = [];
   const groupByCourse = new Map<string, LmsTableGroup>();
@@ -126,9 +139,8 @@ async function getLmsFeatureInternal(jar: CookieJar, kind: LmsKind): Promise<Lms
   const sourcePages: string[] = [];
 
   const addGroup = (course: string, table: PortalTable) => {
-    // The identical table under several courses (e.g. a page that ignores
-    // the course parameter) is kept once, under the first label produced.
-    const sig = JSON.stringify([table.headers, table.rows.slice(0, 3), table.rows.length]);
+    // Deduplicate within a course without hiding identical data from other courses.
+    const sig = JSON.stringify([course, table.headers, table.rows, table.cellLinks]);
     if (seenTables.has(sig)) return;
     seenTables.add(sig);
     let g = groupByCourse.get(course);
@@ -140,7 +152,12 @@ async function getLmsFeatureInternal(jar: CookieJar, kind: LmsKind): Promise<Lms
     const url = LMS_BASE_URL + path;
     const first = await lmsGet(jar, url);
     sourcePages.push(first.url);
-    const selects = analyzeLmsSelects(first.html);
+    let selects = analyzeLmsSelects(first.html);
+    if (!selects.courses.length && selects.semesterValue) {
+      const semester = await lmsGet(jar, `${url}?s=${queryValue(selects.semesterValue)}`);
+      sourcePages.push(semester.url);
+      selects = analyzeLmsSelects(semester.html);
+    }
 
     // The bare page may already carry a real table (e.g. CourseOutline
     // lists every course without a selection).
@@ -149,8 +166,8 @@ async function getLmsFeatureInternal(jar: CookieJar, kind: LmsKind): Promise<Lms
     if (landingTable) addGroup(landing.title || kind, landingTable);
 
     for (const course of selects.courses.slice(0, 12)) {
-      // Browser-faithful: option values go into the query string raw.
-      const courseUrl = `${url}?s=${selects.semesterValue}&oc=${course.value}`;
+      // Avoid both double-encoding and raw query-string delimiters.
+      const courseUrl = `${url}?s=${queryValue(selects.semesterValue)}&oc=${queryValue(course.value)}`;
       const res = await lmsGet(jar, courseUrl);
       sourcePages.push(res.url);
       const page = parsePortalPage(res.html, res.url);

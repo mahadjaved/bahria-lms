@@ -3,26 +3,13 @@ import type { SessionData } from "./types";
 
 export const SESSION_COOKIE = "bahria_session";
 export const SESSION_TTL_MS = 12 * 60 * 60 * 1000; // 12 hours, sliding
-export const SESSION_COOKIE_MAX_AGE = 12 * 60 * 60; // seconds
+export const SESSION_COOKIE_MAX_AGE = 30 * 24 * 60 * 60; // browser retention; server enforces inactivity TTL
 
 // WARNING: the fallback is only for local development. Always set SESSION_SECRET in production.
 const SECRET = process.env.SESSION_SECRET || "dev-only-insecure-secret-change-me-please";
 function key(): Buffer { return createHash("sha256").update(SECRET).digest(); }
 
-/* ------------------------------------------------------------------ */
-/* Authoritative session carrier: the whole session, AES-256-GCM       */
-/* encrypted into the browser cookie and re-issued on every response.  */
-/*                                                                     */
-/* Why the cookie again (v1 failed at this!): v1 encrypted the jar     */
-/* into the cookie at login but NEVER wrote the refreshed jar back, so */
-/* Aspire's cookie rotation stranded the browser with a stale jar.    */
-/* Now `withSessionCookie` (lib/api-helpers.ts) re-encrypts the live   */
-/* session into the cookie on EVERY API response, success or error —   */
-/* the browser always presents the freshest jar, on ANY server         */
-/* process or instance. The server-side store is just a cache + lock.  */
-/* Token layout: base64url( iv[12] || authTag[16] || ciphertext ).     */
-/* ------------------------------------------------------------------ */
-
+/** Encrypted session payloads from earlier releases are accepted for migration. */
 export interface SessionCookiePayload {
   id: string;
   enrollment: string;
@@ -87,13 +74,7 @@ export function decryptSessionPayload(token: string | undefined | null): Session
   } catch { return null; }
 }
 
-/* ------------------------------------------------------------------ */
-/* Legacy (v2) cookie: "<id>.<base64url hmac>" — id-only, jar in the   */
-/* server store. Kept so sessions minted before this release can be    */
-/* migrated: getSession() accepts a legacy cookie when a matching      */
-/* store entry exists, and the next response upgrades it to a payload. */
-/* ------------------------------------------------------------------ */
-
+/** Signed opaque identifier for the server-side session. */
 export function signSessionId(id: string): string {
   const sig = createHmac("sha256", key()).update(id).digest("base64url");
   return `${id}.${sig}`;
