@@ -3,7 +3,6 @@ import { getSession } from "@/lib/session-server";
 import { ensureNav } from "@/lib/bahria/client";
 import { PORTAL_FEATURES, PORTAL_PATHS } from "@/lib/bahria/paths";
 import { BAHRIA_BASE_URL, LMS_BASE_URL } from "@/lib/bahria/constants";
-import { withSessionCookie } from "@/lib/api-helpers";
 import { UnauthorizedError, type SessionData } from "@/lib/bahria/types";
 
 /** Features served from the LMS host; everything else is a CMS (/Sys/...) page. */
@@ -28,12 +27,11 @@ export async function GET() {
       const base = LMS_FEATURES.has(feature) ? LMS_BASE_URL : BAHRIA_BASE_URL;
       resolved[feature] = { url: base + PORTAL_PATHS[feature][0], source: "verified" };
     }
-    return withSessionCookie(NextResponse.json({ ok: true, nav, navDiscoveredAt: session.navDiscoveredAt || null, resolved }), session);
+    return NextResponse.json({ ok: true, nav, navDiscoveredAt: session.navDiscoveredAt || null, resolved });
   } catch (e) {
     const res = e instanceof UnauthorizedError
       ? NextResponse.json({ ok: false, error: e.message }, { status: 401 })
       : NextResponse.json({ ok: false, error: e instanceof Error ? e.message : "Diagnostics failed" }, { status: 502 });
-    if (session) withSessionCookie(res, session);
     return res;
   }
 }

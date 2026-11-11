@@ -16,17 +16,7 @@ export interface PortalPage {
   text: string;
 }
 
-/**
- * A live Bahria session. The authoritative copy travels with the browser in
- * the AES-256-GCM-encrypted `bahria_session` cookie (see session.ts), which
- * is re-issued on every API response with the freshest cookie jar — so the
- * session works on any server process/instance, not just the one that
- * handled the login. The server-side store (lib/bahria/store.ts) remains as
- * a per-process cache + request lock and is merged with the cookie payload
- * on every read (whichever has the larger `jarUpdatedAt` wins).
- * `cookies` is the live, mutable Bahria cookie jar: Aspire rotates its
- * session cookie after login, so the jar is updated after every response.
- */
+/** A server-side session, identified by a signed browser cookie. */
 export interface SessionData {
   id: string;
   cookies: Record<string, string>;
